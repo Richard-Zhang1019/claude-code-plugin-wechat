@@ -1,0 +1,36 @@
+{
+  "name": "@openclaw-wechat/claude-code-channel",
+  "version": "0.1.0",
+  "description": "WeChat to Claude Code bridge using ClawBot ilink API and MCP Channel protocol",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "wechat-channel": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "bun run dist/cli.js",
+    "login": "bun run dist/cli.js login"
+  },
+  "keywords": [
+    "wechat",
+    "claude-code",
+    "mcp",
+    "channel",
+    "clawbot",
+    "ilink"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "bun": ">=1.0.0"
+  }
+}
