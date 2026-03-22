@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "wechat": {
+      "command": "bun",
+      "args": ["/Users/ayu/Desktop/claude-code-plugin-wechat/dist/channel.js"]
+    }
+  }
+}

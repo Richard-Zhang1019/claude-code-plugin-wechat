@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun add:*)",
+      "Bash(claude --version)",
+      "Bash(chmod +x /Users/ayu/Desktop/claude-code-plugin-wechat/test-reply.sh)",
+      "Bash(/Users/ayu/Desktop/claude-code-plugin-wechat/test-reply.sh)",
+      "Bash(ls -lh *.md *.sh)",
+      "Read(//Users/ayu/Desktop/claude-code-plugin-wechat/**)",
+      "Bash(ls -lh *.md)",
+      "Bash(ls -1 *.md)",
+      "Bash(ls -1 *.json *.ts)",
+      "Bash(ls -d */)",
+      "Bash(ls -1 *.json)"
+    ],
+    "additionalDirectories": [
+      "/Users/ayu/.config"
+    ]
+  }
+}

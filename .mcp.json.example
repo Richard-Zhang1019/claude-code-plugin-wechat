@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "wechat": {
-      "command": "bun",
-      "args": ["/Users/ayu/Desktop/openclaw-wechat/dist/cli.js"]
-    }
-  }
-}

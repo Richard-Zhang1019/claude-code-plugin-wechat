@@ -1,385 +1,619 @@
+#!/usr/bin/env bun
 /**
- * MCP Channel Server for WeChat
+ * Claude Code WeChat Channel Plugin
  *
- * This implements an MCP server that:
- * 1. Polls WeChat for new messages via ilink API
- * 2. Pushes them to Claude Code via channel events
- * 3. Exposes a tool for Claude to reply back
+ * Bridges WeChat messages into a Claude Code session via the Channels MCP protocol.
+ * Uses the official WeChat ClawBot ilink API.
+ *
+ * Flow:
+ *   1. QR login via ilink/bot/get_bot_qrcode + get_qrcode_status
+ *   2. Long-poll ilink/bot/getupdates for incoming WeChat messages
+ *   3. Forward messages to Claude Code as <channel> events
+ *   4. Expose a reply tool so Claude can send messages back
  */
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-  CallToolRequestSchema,
   ListToolsRequestSchema,
-  Tool,
+  CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { IlinkApiClient } from "./ilink-api.js";
-import type { WeixinCredentials, WeixinMessage } from "./types.js";
 
-/** Config storage path */
-const CONFIG_PATH = `${process.env.HOME}/.config/wechat-channel.json`;
+// ── Config ────────────────────────────────────────────────────────────────────
 
-/** Load config from disk */
-async function loadConfig(): Promise<{ credentials?: WeixinCredentials; allowedSenders?: string[] }> {
+const CHANNEL_NAME = "wechat";
+const CHANNEL_VERSION = "0.1.0";
+const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
+const BOT_TYPE = "3";
+const CREDENTIALS_DIR = path.join(
+  process.env.HOME || "~",
+  ".claude",
+  "channels",
+  "wechat",
+);
+const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "account.json");
+
+const LONG_POLL_TIMEOUT_MS = 35_000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const BACKOFF_DELAY_MS = 30_000;
+const RETRY_DELAY_MS = 2_000;
+
+// ── Logging (stderr only — stdout is MCP stdio) ─────────────────────────────
+
+function log(msg: string): void {
+  process.stderr.write(`[wechat-channel] ${msg}\n`);
+}
+
+function logError(msg: string): void {
+  process.stderr.write(`[wechat-channel] ERROR: ${msg}\n`);
+}
+
+// ── Credentials ──────────────────────────────────────────────────────────────
+
+interface AccountData {
+  token: string;
+  baseUrl: string;
+  accountId: string;
+  userId?: string;
+  savedAt: string;
+}
+
+function loadCredentials(): AccountData | null {
   try {
-    const content = await Bun.file(CONFIG_PATH).text();
-    return JSON.parse(content);
+    if (!fs.existsSync(CREDENTIALS_FILE)) return null;
+    return JSON.parse(fs.readFileSync(CREDENTIALS_FILE, "utf-8"));
   } catch {
-    return {};
+    return null;
   }
 }
 
-/** Save config to disk */
-function saveConfig(config: Record<string, unknown>): void {
-  const dir = CONFIG_PATH.split("/").slice(0, -1).join("/");
-  Bun.write(CONFIG_PATH, JSON.stringify(config, null, 2));
+function saveCredentials(data: AccountData): void {
+  fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
+  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(data, null, 2), "utf-8");
+  try {
+    fs.chmodSync(CREDENTIALS_FILE, 0o600);
+  } catch {
+    // best-effort
+  }
 }
 
-/** Extract text from WeChat message */
-function extractText(msg: WeixinMessage): string {
+// ── WeChat ilink API ─────────────────────────────────────────────────────────
+
+function randomWechatUin(): string {
+  const uint32 = crypto.randomBytes(4).readUInt32BE(0);
+  return Buffer.from(String(uint32), "utf-8").toString("base64");
+}
+
+function buildHeaders(token?: string, body?: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    AuthorizationType: "ilink_bot_token",
+    "X-WECHAT-UIN": randomWechatUin(),
+  };
+  if (body) {
+    headers["Content-Length"] = String(Buffer.byteLength(body, "utf-8"));
+  }
+  if (token?.trim()) {
+    headers.Authorization = `Bearer ${token.trim()}`;
+  }
+  return headers;
+}
+
+async function apiFetch(params: {
+  baseUrl: string;
+  endpoint: string;
+  body: string;
+  token?: string;
+  timeoutMs: number;
+}): Promise<string> {
+  const base = params.baseUrl.endsWith("/")
+    ? params.baseUrl
+    : `${params.baseUrl}/`;
+  const url = new URL(params.endpoint, base).toString();
+  const headers = buildHeaders(params.token, params.body);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), params.timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: params.body,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    const text = await res.text();
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${text}`);
+    return text;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
+// ── QR Login ─────────────────────────────────────────────────────────────────
+
+interface QRCodeResponse {
+  qrcode: string;
+  qrcode_img_content: string;
+}
+
+interface QRStatusResponse {
+  status: "wait" | "scaned" | "confirmed" | "expired";
+  bot_token?: string;
+  ilink_bot_id?: string;
+  baseurl?: string;
+  ilink_user_id?: string;
+}
+
+async function fetchQRCode(baseUrl: string): Promise<QRCodeResponse> {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const url = new URL(
+    `ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(BOT_TYPE)}`,
+    base,
+  );
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`QR fetch failed: ${res.status}`);
+  return (await res.json()) as QRCodeResponse;
+}
+
+async function pollQRStatus(
+  baseUrl: string,
+  qrcode: string,
+): Promise<QRStatusResponse> {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  const url = new URL(
+    `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`,
+    base,
+  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35_000);
+  try {
+    const res = await fetch(url.toString(), {
+      headers: { "iLink-App-ClientVersion": "1" },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`QR status failed: ${res.status}`);
+    return (await res.json()) as QRStatusResponse;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err instanceof Error && err.name === "AbortError") {
+      return { status: "wait" };
+    }
+    throw err;
+  }
+}
+
+async function doQRLogin(
+  baseUrl: string,
+): Promise<AccountData | null> {
+  log("正在获取微信登录二维码...");
+  const qrResp = await fetchQRCode(baseUrl);
+
+  log("\n请使用微信扫描以下二维码：\n");
+  try {
+    const qrterm = await import("qrcode-terminal");
+    await new Promise<void>((resolve) => {
+      qrterm.default.generate(
+        qrResp.qrcode_img_content,
+        { small: true },
+        (qr: string) => {
+          process.stderr.write(qr + "\n");
+          resolve();
+        },
+      );
+    });
+  } catch {
+    log(`二维码链接: ${qrResp.qrcode_img_content}`);
+  }
+
+  log("等待扫码...");
+  const deadline = Date.now() + 480_000;
+  let scannedPrinted = false;
+
+  while (Date.now() < deadline) {
+    const status = await pollQRStatus(baseUrl, qrResp.qrcode);
+
+    switch (status.status) {
+      case "wait":
+        break;
+      case "scaned":
+        if (!scannedPrinted) {
+          log("👀 已扫码，请在微信中确认...");
+          scannedPrinted = true;
+        }
+        break;
+      case "expired":
+        log("二维码已过期，请重新启动。");
+        return null;
+      case "confirmed": {
+        if (!status.ilink_bot_id || !status.bot_token) {
+          logError("登录确认但未返回 bot 信息");
+          return null;
+        }
+        const account: AccountData = {
+          token: status.bot_token,
+          baseUrl: status.baseurl || baseUrl,
+          accountId: status.ilink_bot_id,
+          userId: status.ilink_user_id,
+          savedAt: new Date().toISOString(),
+        };
+        saveCredentials(account);
+        log("✅ 微信连接成功！");
+        return account;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  log("登录超时");
+  return null;
+}
+
+// ── WeChat Message Types ─────────────────────────────────────────────────────
+
+interface TextItem {
+  text?: string;
+}
+
+interface RefMessage {
+  message_item?: MessageItem;
+  title?: string;
+}
+
+interface MessageItem {
+  type?: number;
+  text_item?: TextItem;
+  voice_item?: { text?: string };
+  ref_msg?: RefMessage;
+}
+
+interface WeixinMessage {
+  from_user_id?: string;
+  to_user_id?: string;
+  client_id?: string;
+  session_id?: string;
+  message_type?: number;
+  message_state?: number;
+  item_list?: MessageItem[];
+  context_token?: string;
+  create_time_ms?: number;
+}
+
+interface GetUpdatesResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  msgs?: WeixinMessage[];
+  get_updates_buf?: string;
+  longpolling_timeout_ms?: number;
+}
+
+// Message type constants
+const MSG_TYPE_USER = 1;
+const MSG_ITEM_TEXT = 1;
+const MSG_ITEM_VOICE = 3;
+const MSG_TYPE_BOT = 2;
+const MSG_STATE_FINISH = 2;
+
+function extractTextFromMessage(msg: WeixinMessage): string {
   if (!msg.item_list?.length) return "";
-
   for (const item of msg.item_list) {
-    if (item.type === 1 && item.text_item?.text) {
-      // Text message
-      return String(item.text_item.text);
+    if (item.type === MSG_ITEM_TEXT && item.text_item?.text) {
+      const text = item.text_item.text;
+      const ref = item.ref_msg;
+      if (!ref) return text;
+      const parts: string[] = [];
+      if (ref.title) parts.push(ref.title);
+      if (!parts.length) return text;
+      return `[引用: ${parts.join(" | ")}]\n${text}`;
     }
-    if (item.type === 3 && item.voice_item?.text) {
-      // Voice with transcription
-      return `[Voice] ${item.voice_item.text}`;
-    }
-    if (item.type === 2) {
-      return "[Image]";
-    }
-    if (item.type === 4) {
-      return `[File: ${item.file_item?.file_name || "attachment"}]`;
-    }
-    if (item.type === 5) {
-      return "[Video]";
+    if (item.type === MSG_ITEM_VOICE && item.voice_item?.text) {
+      return item.voice_item.text;
     }
   }
-
   return "";
 }
 
-/** Format message for Claude */
-function formatMessageForClaude(msg: WeixinMessage): string {
-  const text = extractText(msg);
-  const userId = msg.from_user_id || "unknown";
-  return `📱 WeChat message from ${userId}: ${text}`;
+// ── Context Token Cache ──────────────────────────────────────────────────────
+
+const contextTokenCache = new Map<string, string>();
+
+function cacheContextToken(userId: string, token: string): void {
+  contextTokenCache.set(userId, token);
 }
 
-/**
- * WeChat Channel Server
- */
-export class WeChatChannelServer {
-  private server: Server;
-  private api: IlinkApiClient;
-  private credentials: WeixinCredentials | undefined;
-  private allowedSenders: Set<string>;
-  private contextTokens: Map<string, string>; // userId -> context_token
-  private running: boolean = false;
-  private pollInterval: number = 1000; // ms between polls
+function getCachedContextToken(userId: string): string | undefined {
+  return contextTokenCache.get(userId);
+}
 
-  constructor(credentials?: WeixinCredentials, allowedSenders: string[] = []) {
-    this.credentials = credentials;
-    this.allowedSenders = new Set(allowedSenders);
-    this.contextTokens = new Map();
+// ── getUpdates / sendMessage ─────────────────────────────────────────────────
 
-    // Initialize API client
-    const baseUrl = credentials?.baseUrl || "https://ilinkai.weixin.qq.com/";
-    this.api = new IlinkApiClient(baseUrl);
+async function getUpdates(
+  baseUrl: string,
+  token: string,
+  getUpdatesBuf: string,
+): Promise<GetUpdatesResp> {
+  try {
+    const raw = await apiFetch({
+      baseUrl,
+      endpoint: "ilink/bot/getupdates",
+      body: JSON.stringify({
+        get_updates_buf: getUpdatesBuf,
+        base_info: { channel_version: CHANNEL_VERSION },
+      }),
+      token,
+      timeoutMs: LONG_POLL_TIMEOUT_MS,
+    });
+    return JSON.parse(raw) as GetUpdatesResp;
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf };
+    }
+    throw err;
+  }
+}
 
-    // Create MCP server
-    this.server = new Server(
-      {
-        name: "wechat-channel",
-        version: "0.1.0",
+function generateClientId(): string {
+  return `claude-code-wechat:${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+}
+
+async function sendTextMessage(
+  baseUrl: string,
+  token: string,
+  to: string,
+  text: string,
+  contextToken: string,
+): Promise<string> {
+  const clientId = generateClientId();
+
+  const requestBody = {
+    msg: {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MSG_TYPE_BOT,
+      message_state: MSG_STATE_FINISH,
+      item_list: [{ type: MSG_ITEM_TEXT, text_item: { text } }],
+      context_token: contextToken,
+    },
+    base_info: { channel_version: CHANNEL_VERSION },
+  };
+
+  await apiFetch({
+    baseUrl,
+    endpoint: "ilink/bot/sendmessage",
+    body: JSON.stringify(requestBody),
+    token,
+    timeoutMs: 15_000,
+  });
+
+  return clientId;
+}
+
+// ── MCP Channel Server ──────────────────────────────────────────────────────
+
+const mcp = new Server(
+  { name: CHANNEL_NAME, version: CHANNEL_VERSION },
+  {
+    capabilities: {
+      experimental: { "claude/channel": {} },
+      tools: {},
+    },
+    instructions: [
+      `Messages from WeChat users arrive as `,
+      `Reply using the wechat_reply tool. You MUST pass the sender_id from the inbound tag.`,
+      `Messages are from real WeChat users via the WeChat ClawBot interface.`,
+      `Respond naturally in Chinese unless the user writes in another language.`,
+      `Keep replies concise — WeChat is a chat app, not an essay platform.`,
+      `Strip markdown formatting (WeChat doesn't render it). Use plain text.`,
+    ].join("\n"),
+  },
+);
+
+// Tool: reply to WeChat
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "wechat_reply",
+      description: "Send a text reply back to the WeChat user",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          sender_id: {
+            type: "string",
+            description:
+              "The sender_id from the inbound tag (xxx@im.wechat format)",
+          },
+          text: {
+            type: "string",
+            description: "The plain-text message to send (no markdown)",
+          },
+        },
+        required: ["sender_id", "text"],
       },
-      {
-        capabilities: {
-          tools: {},
-          // Channel capability - this tells Claude Code we can push events
-          // Note: The exact capability name may vary based on MCP spec
-        },
-      }
-    );
+    },
+  ],
+}));
 
-    this.setupHandlers();
-  }
+let activeAccount: AccountData | null = null;
 
-  /** Setup MCP request handlers */
-  private setupHandlers(): void {
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const tools: Tool[] = [
-        {
-          name: "wechat_reply",
-          description: "Reply to a WeChat message. Use this when you need to send a message back to a WeChat user who previously messaged you.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              userId: {
-                type: "string",
-                description: "The WeChat user ID to reply to",
-              },
-              message: {
-                type: "string",
-                description: "The message text to send",
-              },
-            },
-            required: ["userId", "message"],
-          },
-        },
-      ];
-      return { tools };
-    });
+mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+  if (req.params.name === "wechat_reply") {
+    const { sender_id, text } = req.params.arguments as {
+      sender_id: string;
+      text: string;
+    };
 
-    // Handle tool calls
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
-      if (name === "wechat_reply") {
-        return await this.handleReply(args as { userId: string; message: string });
-      }
-
+    if (!activeAccount) {
       return {
-        content: [
-          {
-            type: "text",
-            text: `Unknown tool: ${name}`,
-          },
-        ],
-      };
-    });
-  }
-
-  /** Handle reply tool call from Claude */
-  private async handleReply(args: { userId: string; message: string }): Promise<{
-    content: Array<{ type: string; text: string }>;
-    isError?: boolean;
-  }> {
-    if (!this.credentials) {
-      return {
-        content: [{ type: "text", text: "Not logged in to WeChat" }],
-        isError: true,
+        content: [{ type: "text" as const, text: "error: not logged in" }],
       };
     }
 
-    // Check if sender is allowed
-    if (!this.allowedSenders.has(args.userId)) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `User ${args.userId} is not in the allowlist. Cannot send reply.`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // Get context token for this user
-    const contextToken = this.contextTokens.get(args.userId);
+    const contextToken = getCachedContextToken(sender_id);
     if (!contextToken) {
       return {
         content: [
           {
-            type: "text",
-            text: `No context token found for user ${args.userId}. They may need to send a message first.`,
+            type: "text" as const,
+            text: `error: no context_token for ${sender_id}. The user may need to send a message first.`,
           },
         ],
-        isError: true,
       };
     }
 
     try {
-      await this.api.sendMessage({
-        token: this.credentials.botToken,
-        toUserId: args.userId,
+      await sendTextMessage(
+        activeAccount.baseUrl,
+        activeAccount.token,
+        sender_id,
+        text,
         contextToken,
-        text: args.message,
-      });
-
+      );
+      return { content: [{ type: "text" as const, text: "sent" }] };
+    } catch (err) {
       return {
         content: [
-          {
-            type: "text",
-            text: `✅ Sent reply to ${args.userId}: ${args.message}`,
-          },
+          { type: "text" as const, text: `send failed: ${String(err)}` },
         ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Failed to send message: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-        isError: true,
       };
     }
   }
+  throw new Error(`unknown tool: ${req.params.name}`);
+});
 
-  /** Start the channel server */
-  async start(): Promise<void> {
-    if (!this.credentials) {
-      throw new Error("No credentials available. Please login first.");
+// ── Long-poll loop ──────────────────────────────────────────────────────────
+
+async function startPolling(account: AccountData): Promise<never> {
+  const { baseUrl, token } = account;
+  let getUpdatesBuf = "";
+  let consecutiveFailures = 0;
+
+  // Load cached sync buf if available
+  const syncBufFile = path.join(CREDENTIALS_DIR, "sync_buf.txt");
+  try {
+    if (fs.existsSync(syncBufFile)) {
+      getUpdatesBuf = fs.readFileSync(syncBufFile, "utf-8");
+      log(`恢复上次同步状态 (${getUpdatesBuf.length} bytes)`);
     }
-
-    this.running = true;
-
-    // Connect to stdio for MCP communication
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-
-    // Start polling for messages
-    this.pollMessages().catch((error) => {
-      console.error(`Polling error: ${error}`);
-      this.running = false;
-    });
+  } catch {
+    // ignore
   }
 
-  /** Poll for new messages and push to Claude */
-  private async pollMessages(): Promise<void> {
-    let getUpdatesBuf = "";
+  log("开始监听微信消息...");
 
-    while (this.running) {
-      try {
-        const response = await this.api.getUpdates({
-          token: this.credentials!.botToken,
-          getUpdatesBuf,
-          timeoutMs: 35000,
+  while (true) {
+    try {
+      const resp = await getUpdates(baseUrl, token, getUpdatesBuf);
+
+      // Handle API errors
+      const isError =
+        (resp.ret !== undefined && resp.ret !== 0) ||
+        (resp.errcode !== undefined && resp.errcode !== 0);
+      if (isError) {
+        consecutiveFailures++;
+        logError(
+          `getUpdates 失败: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg ?? ""}`,
+        );
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          logError(
+            `连续失败 ${MAX_CONSECUTIVE_FAILURES} 次，等待 ${BACKOFF_DELAY_MS / 1000}s`,
+          );
+          consecutiveFailures = 0;
+          await new Promise((r) => setTimeout(r, BACKOFF_DELAY_MS));
+        } else {
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        }
+        continue;
+      }
+
+      consecutiveFailures = 0;
+
+      // Save sync buf
+      if (resp.get_updates_buf) {
+        getUpdatesBuf = resp.get_updates_buf;
+        try {
+          fs.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
+        } catch {
+          // ignore
+        }
+      }
+
+      // Process messages
+      for (const msg of resp.msgs ?? []) {
+        // Only process user messages (not bot messages)
+        if (msg.message_type !== MSG_TYPE_USER) continue;
+
+        const text = extractTextFromMessage(msg);
+        if (!text) continue;
+
+        const senderId = msg.from_user_id ?? "unknown";
+
+        // Cache context token for reply
+        if (msg.context_token) {
+          cacheContextToken(senderId, msg.context_token);
+        }
+
+        // Push to Claude Code session (source is auto-added from server name)
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: text,
+            meta: {
+              sender: senderId.split("@")[0] || senderId,
+              sender_id: senderId,
+            },
+          },
         });
-
-        if (response.get_updates_buf) {
-          getUpdatesBuf = response.get_updates_buf;
-        }
-
-        if (response.errcode && response.errcode !== 0) {
-          console.error(`WeChat API error: ${response.errcode} ${response.errmsg}`);
-          await new Promise((r) => setTimeout(r, 5000));
-          continue;
-        }
-
-        // Process new messages
-        for (const msg of response.msgs || []) {
-          await this.handleIncomingMessage(msg);
-        }
-
-        // Small delay before next poll
-        await new Promise((r) => setTimeout(r, this.pollInterval));
-      } catch (error) {
-        console.error(`Poll error: ${error}`);
-        await new Promise((r) => setTimeout(r, 5000));
+      }
+    } catch (err) {
+      consecutiveFailures++;
+      logError(`轮询异常: ${String(err)}`);
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        consecutiveFailures = 0;
+        await new Promise((r) => setTimeout(r, BACKOFF_DELAY_MS));
+      } else {
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
       }
     }
-  }
-
-  /** Handle incoming message from WeChat */
-  private async handleIncomingMessage(msg: WeixinMessage): Promise<void> {
-    const userId = msg.from_user_id;
-    if (!userId) return;
-
-    // Store context token for replies
-    if (msg.context_token) {
-      this.contextTokens.set(userId, msg.context_token);
-    }
-
-    // Check allowlist (auto-add first sender for pairing)
-    if (this.allowedSenders.size === 0 || this.allowedSenders.has(userId)) {
-      // Push message to Claude via channel event
-      // Note: The exact API for pushing events may vary
-      // This is a placeholder for the actual channel push mechanism
-      const message = formatMessageForClaude(msg);
-
-      // Log to stderr so it doesn't interfere with MCP stdio
-      console.error(`📨 Message from ${userId}: ${extractText(msg)}`);
-
-      // TODO: Use proper MCP channel event API when available
-      // For now, we rely on Claude to notice via the wechat_reply tool
-    } else {
-      console.error(`⚠️ Dropped message from unauthorized user: ${userId}`);
-    }
-  }
-
-  /** Stop the channel server */
-  stop(): void {
-    this.running = false;
-  }
-
-  /** Login to WeChat and save credentials */
-  static async login(opts: { verbose?: boolean; timeoutMs?: number }): Promise<void> {
-    const api = new IlinkApiClient();
-    const result = await api.loginWithQR(opts);
-
-    if (!result.connected || !result.botToken || !result.accountId) {
-      throw new Error(result.message || "Login failed");
-    }
-
-    // Save credentials
-    const config = await loadConfig();
-    config.credentials = {
-      botToken: result.botToken,
-      accountId: result.accountId,
-      userId: result.userId || "",
-      baseUrl: result.baseUrl || "https://ilinkai.weixin.qq.com/",
-      createdAt: Date.now(),
-    };
-
-    // Auto-add the user who scanned to allowlist
-    if (result.userId) {
-      if (!config.allowedSenders) {
-        config.allowedSenders = [];
-      }
-      if (!config.allowedSenders.includes(result.userId)) {
-        config.allowedSenders.push(result.userId);
-      }
-    }
-
-    saveConfig(config);
-    console.log(`✅ Login successful! Account ID: ${result.accountId}`);
-  }
-
-  /** Add a sender to the allowlist */
-  static async addAllowedSender(userId: string): Promise<void> {
-    const config = await loadConfig();
-    if (!config.allowedSenders) {
-      config.allowedSenders = [];
-    }
-    if (!config.allowedSenders.includes(userId)) {
-      config.allowedSenders.push(userId);
-      saveConfig(config);
-      console.log(`✅ Added ${userId} to allowlist`);
-    } else {
-      console.log(`ℹ️ ${userId} is already in allowlist`);
-    }
-  }
-
-  /** Show current status */
-  static async status(): Promise<void> {
-    const config = await loadConfig();
-    if (config.credentials) {
-      console.log(`✅ Logged in as: ${config.credentials.accountId}`);
-      console.log(`📱 Base URL: ${config.credentials.baseUrl}`);
-      console.log(`🔐 Token: ${config.credentials.botToken.slice(0, 20)}...`);
-    } else {
-      console.log(`❌ Not logged in`);
-    }
-    if (config.allowedSenders?.length) {
-      console.log(`✅ Allowed senders: ${config.allowedSenders.join(", ")}`);
-    } else {
-      console.log(`⚠️ No allowed senders configured`);
-    }
-  }
-
-  /** Logout and clear credentials */
-  static async logout(): Promise<void> {
-    const config = await loadConfig();
-    delete config.credentials;
-    saveConfig(config);
-    console.log(`✅ Logged out`);
   }
 }
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  // Connect MCP transport first (Claude Code expects stdio handshake)
+  await mcp.connect(new StdioServerTransport());
+  log("MCP 连接就绪");
+
+  // Check for saved credentials
+  let account = loadCredentials();
+
+  if (!account) {
+    log("未找到已保存的凭据，启动微信扫码登录...");
+    account = await doQRLogin(DEFAULT_BASE_URL);
+    if (!account) {
+      logError("登录失败，退出。");
+      process.exit(1);
+    }
+  } else {
+    log(`使用已保存账号: ${account.accountId}`);
+  }
+
+  activeAccount = account;
+
+  // Start long-poll (runs forever)
+  await startPolling(account);
+}
+
+main().catch((err) => {
+  logError(`Fatal: ${String(err)}`);
+  process.exit(1);
+});
+
+export { main, doQRLogin, loadCredentials };
