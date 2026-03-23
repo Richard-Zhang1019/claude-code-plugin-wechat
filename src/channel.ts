@@ -36,6 +36,8 @@ const CREDENTIALS_DIR = path.join(
   "wechat",
 );
 const CREDENTIALS_FILE = path.join(CREDENTIALS_DIR, "account.json");
+const SYNC_BUF_FILE = path.join(CREDENTIALS_DIR, "sync_buf.txt");
+const CONTEXT_TOKENS_FILE = path.join(CREDENTIALS_DIR, "context_tokens.json");
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -62,6 +64,13 @@ interface AccountData {
   savedAt: string;
 }
 
+function atomicWriteFile(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, content, "utf-8");
+  fs.renameSync(tmpPath, filePath);
+}
+
 function loadCredentials(): AccountData | null {
   try {
     if (!fs.existsSync(CREDENTIALS_FILE)) return null;
@@ -72,8 +81,7 @@ function loadCredentials(): AccountData | null {
 }
 
 function saveCredentials(data: AccountData): void {
-  fs.mkdirSync(CREDENTIALS_DIR, { recursive: true });
-  fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(data, null, 2), "utf-8");
+  atomicWriteFile(CREDENTIALS_FILE, JSON.stringify(data, null, 2));
   try {
     fs.chmodSync(CREDENTIALS_FILE, 0o600);
   } catch {
@@ -323,8 +331,33 @@ function extractTextFromMessage(msg: WeixinMessage): string {
 
 const contextTokenCache = new Map<string, string>();
 
+function loadContextTokens(): void {
+  try {
+    if (!fs.existsSync(CONTEXT_TOKENS_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(CONTEXT_TOKENS_FILE, "utf-8")) as Record<string, string>;
+    for (const [userId, token] of Object.entries(parsed)) {
+      if (userId && token) contextTokenCache.set(userId, token);
+    }
+  } catch (err) {
+    logError(`加载 context token 缓存失败: ${String(err)}`);
+  }
+}
+
+function persistContextTokens(): void {
+  try {
+    atomicWriteFile(
+      CONTEXT_TOKENS_FILE,
+      JSON.stringify(Object.fromEntries(contextTokenCache.entries()), null, 2),
+    );
+    fs.chmodSync(CONTEXT_TOKENS_FILE, 0o600);
+  } catch (err) {
+    logError(`保存 context token 缓存失败: ${String(err)}`);
+  }
+}
+
 function cacheContextToken(userId: string, token: string): void {
   contextTokenCache.set(userId, token);
+  persistContextTokens();
 }
 
 function getCachedContextToken(userId: string): string | undefined {
@@ -495,10 +528,9 @@ async function startPolling(account: AccountData): Promise<never> {
   let consecutiveFailures = 0;
 
   // Load cached sync buf if available
-  const syncBufFile = path.join(CREDENTIALS_DIR, "sync_buf.txt");
   try {
-    if (fs.existsSync(syncBufFile)) {
-      getUpdatesBuf = fs.readFileSync(syncBufFile, "utf-8");
+    if (fs.existsSync(SYNC_BUF_FILE)) {
+      getUpdatesBuf = fs.readFileSync(SYNC_BUF_FILE, "utf-8");
       log(`恢复上次同步状态 (${getUpdatesBuf.length} bytes)`);
     }
   } catch {
@@ -538,7 +570,7 @@ async function startPolling(account: AccountData): Promise<never> {
       if (resp.get_updates_buf) {
         getUpdatesBuf = resp.get_updates_buf;
         try {
-          fs.writeFileSync(syncBufFile, getUpdatesBuf, "utf-8");
+          atomicWriteFile(SYNC_BUF_FILE, getUpdatesBuf);
         } catch {
           // ignore
         }
@@ -606,6 +638,7 @@ async function main(): Promise<void> {
   }
 
   activeAccount = account;
+  loadContextTokens();
 
   // Start long-poll (runs forever)
   await startPolling(account);
